@@ -1,14 +1,21 @@
 import redis
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def connect_to_redis():
-    redis_host = "34.89.222.23"
-    redis_port = 6379
-    redis_password = "RKr3d1s!"
+    redis_host = os.getenv("REDIS_HOST")
+    redis_port = os.getenv("REDIS_PORT")
+    redis_password = os.getenv("REDIS_PASSWORD")
+    
+    if not redis_host or not redis_port or not redis_password:
+        raise ValueError("Redis credentials must be set in .env file")
 
     # Bağlantı havuzu oluştur
     pool = redis.ConnectionPool(
         host=redis_host, 
-        port=redis_port, 
+        port=int(redis_port), 
         password=redis_password, 
         decode_responses=True,
         max_connections=10  # Maksimum 10 bağlantı
