@@ -11,8 +11,38 @@ import pytz
 # Set page config as the first Streamlit command
 st.set_page_config(layout="wide")
 
-# Auto-refresh every 5 minutes (300000 milliseconds)
-count = st_autorefresh(interval=300000, limit=None, key="fizzbuzzcounter")
+# Dynamic Auto-refresh logic
+# Data arrives at minutes ending in 2 or 6 (02, 06, 12, 16, 22, 26...)
+# We refresh 20 seconds after these minutes.
+def get_next_refresh_interval():
+    istanbul_tz = pytz.timezone('Europe/Istanbul')
+    now = datetime.now(istanbul_tz)
+    
+    target_minutes = [2, 6, 12, 16, 22, 26, 32, 36, 42, 46, 52, 56]
+    target_second = 20
+    
+    next_refresh = None
+    
+    for minute in target_minutes:
+        try:
+            candidate = now.replace(minute=minute, second=target_second, microsecond=0)
+            if candidate > now:
+                next_refresh = candidate
+                break
+        except ValueError:
+            continue
+            
+    if next_refresh is None:
+        # Move to next hour
+        next_hour = now + pd.Timedelta(hours=1)
+        # Ensure we don't carry over minutes/seconds that might cause issues, though replace handles it
+        next_refresh = next_hour.replace(minute=target_minutes[0], second=target_second, microsecond=0)
+        
+    seconds_until = (next_refresh - now).total_seconds()
+    return max(1000, int(seconds_until * 1000))
+
+refresh_interval = get_next_refresh_interval()
+st_autorefresh(interval=refresh_interval, key="dynamic_refresh")
 
 # Load environment variables
 load_dotenv()
@@ -53,7 +83,7 @@ def fetch_latest_signals(contracts):
     for contract in contracts:
         try:
             # Fetch ONLY the latest signal for each contract
-            response = supabase.table("signals").select("*").eq("contract", contract).order("snapshot_minute", desc=True).limit(1).execute()
+            response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=True).limit(1).execute()
             if response.data:
                 latest_data_list.extend(response.data)
         except Exception as e:
@@ -80,7 +110,7 @@ def fetch_latest_signals(contracts):
 def fetch_contract_history(contract):
     try:
         # Fetch recent history (e.g., 1000 rows) for a SPECIFIC contract
-        response = supabase.table("signals").select("*").eq("contract", contract).order("snapshot_minute", desc=True).limit(1000).execute()
+        response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=True).limit(1000).execute()
         if response.data:
             df = pd.DataFrame(response.data)
             # Process snapshot_minute
@@ -100,7 +130,7 @@ def fetch_contract_history(contract):
 def fetch_recent_trade_signals(limit=1000):
     try:
         # Fetch recent OPEN_LONG and OPEN_SHORT signals
-        response = supabase.table("signals").select("*").in_("tradeSignal", ["OPEN_LONG", "OPEN_SHORT"]).order("snapshot_minute", desc=True).limit(limit).execute()
+        response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").in_("tradeSignal", ["OPEN_LONG", "OPEN_SHORT"]).order("snapshot_minute", desc=True).limit(limit).execute()
         if response.data:
             df = pd.DataFrame(response.data)
             # Process snapshot_minute
@@ -115,6 +145,71 @@ def fetch_recent_trade_signals(limit=1000):
         print(f"Error fetching recent trade signals: {e}")
     
     return pd.DataFrame()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_structure():
+    try:
+        all_contracts = set()
+        batch_size = 1000
+        max_batches = 30  # Fetch up to 30,000 rows to ensure we cover 3 days
+        
+        # We need to fetch enough data to find the last 3 days.
+        # Since we order by time, we just keep fetching until we have 3 distinct dates.
+        
+        for i in range(max_batches):
+            start = i * batch_size
+            end = start + batch_size - 1
+            
+            response = supabase.table("signals") \
+                .select("contract, snapshot_minute") \
+                .order("snapshot_minute", desc=True) \
+                .range(start, end) \
+                .execute()
+            
+            if not response.data:
+                break
+            
+            df = pd.DataFrame(response.data)
+            unique_in_batch = df['contract'].unique()
+            all_contracts.update(unique_in_batch)
+            
+            # Check if we have enough dates
+            # Quick check: extract dates from what we have so far
+            temp_dates = set()
+            for c in all_contracts:
+                if c.startswith("PH") and len(c) >= 8:
+                    temp_dates.add(c[2:8])
+            
+            # If we have found contracts for more than 3 days, we can probably stop
+            if len(temp_dates) >= 4: 
+                break
+        
+        # Process all found contracts
+        contract_dates = {}
+        for contract in all_contracts:
+            try:
+                # Extract YYMMDD part (index 2 to 8)
+                if contract.startswith("PH") and len(contract) >= 8:
+                    date_part = contract[2:8]
+                    # Convert to readable date string (YYYY-MM-DD)
+                    full_date_str = f"20{date_part[:2]}-{date_part[2:4]}-{date_part[4:]}"
+                    
+                    if full_date_str not in contract_dates:
+                        contract_dates[full_date_str] = []
+                    contract_dates[full_date_str].append(contract)
+            except:
+                continue
+        
+        # Filter: Keep only the top 3 most recent dates
+        sorted_dates = sorted(contract_dates.keys(), reverse=True)
+        top_3_dates = sorted_dates[:3]
+        
+        final_structure = {d: contract_dates[d] for d in top_3_dates}
+        return final_structure
+        
+    except Exception as e:
+        print(f"Error fetching market structure: {e}")
+    return {}
 
 # Status Checks
 redis_status = "Connected"
@@ -136,7 +231,7 @@ top_col1, top_col2 = st.columns([3, 1])
 
 with top_col1:
     st.title("Signal Reader")
-    st_autorefresh(interval=300000, key="datarefresh")
+    # st_autorefresh removed (handled globally)
     st.write(f"Last Updated: {datetime.now(istanbul_tz).strftime('%Y-%m-%d %H:%M:%S')}")
 
 with top_col2:
@@ -170,7 +265,8 @@ def format_time_signal(val):
         return val
 
 # Create Tabs
-tab_dashboard, tab_timeline, tab_history = st.tabs(["Dashboard", "Timeline", "History"])
+# Create Tabs
+tab_dashboard, tab_timeline, tab_history, tab_snapshots = st.tabs(["Dashboard", "Timeline", "History", "Snapshots"])
 
 with tab_dashboard:
     if active_contracts:
@@ -470,72 +566,7 @@ with tab_history:
     def render_history_tab():
         st.subheader("Contract History Analysis")
         
-        # 1. Fetch Market Structure (Dates & Contracts) - Optimized
-        @st.cache_data(ttl=300, show_spinner=False)
-        def fetch_market_structure():
-            try:
-                all_contracts = set()
-                batch_size = 1000
-                max_batches = 30  # Fetch up to 30,000 rows to ensure we cover 3 days
-                
-                # We need to fetch enough data to find the last 3 days.
-                # Since we order by time, we just keep fetching until we have 3 distinct dates.
-                
-                for i in range(max_batches):
-                    start = i * batch_size
-                    end = start + batch_size - 1
-                    
-                    response = supabase.table("snapshots") \
-                        .select("contract, snapshot_minute") \
-                        .order("snapshot_minute", desc=True) \
-                        .range(start, end) \
-                        .execute()
-                    
-                    if not response.data:
-                        break
-                    
-                    df = pd.DataFrame(response.data)
-                    unique_in_batch = df['contract'].unique()
-                    all_contracts.update(unique_in_batch)
-                    
-                    # Check if we have enough dates
-                    # Quick check: extract dates from what we have so far
-                    temp_dates = set()
-                    for c in all_contracts:
-                        if c.startswith("PH") and len(c) >= 8:
-                            temp_dates.add(c[2:8])
-                    
-                    # If we have found contracts for more than 3 days, we can probably stop
-                    if len(temp_dates) >= 4: 
-                        break
-                
-                # Process all found contracts
-                contract_dates = {}
-                for contract in all_contracts:
-                    try:
-                        # Extract YYMMDD part (index 2 to 8)
-                        if contract.startswith("PH") and len(contract) >= 8:
-                            date_part = contract[2:8]
-                            # Convert to readable date string (YYYY-MM-DD)
-                            full_date_str = f"20{date_part[:2]}-{date_part[2:4]}-{date_part[4:]}"
-                            
-                            if full_date_str not in contract_dates:
-                                contract_dates[full_date_str] = []
-                            contract_dates[full_date_str].append(contract)
-                    except:
-                        continue
-                
-                # Filter: Keep only the top 3 most recent dates
-                sorted_dates = sorted(contract_dates.keys(), reverse=True)
-                top_3_dates = sorted_dates[:3]
-                
-                final_structure = {d: contract_dates[d] for d in top_3_dates}
-                return final_structure
-                
-            except Exception as e:
-                print(f"Error fetching market structure: {e}")
-            return {}
-
+        # 1. Fetch Market Structure (Dates & Contracts)
         market_structure = fetch_market_structure()
         
         selected_history_contract = None
@@ -556,14 +587,24 @@ with tab_history:
             @st.cache_data(ttl=60, show_spinner=False)
             def fetch_snapshot_history(contract):
                 try:
-                    # Fetch ONLY the LATEST snapshot for the contract
-                    response = supabase.table("snapshots").select("trades").eq("contract", contract).order("snapshot_minute", desc=True).limit(1).execute()
+                    # Fetch last 100 snapshots to ensure we get history even if recent minutes are empty
+                    # This also builds a better chart than just 1 minute of data
+                    response = supabase.table("snapshots").select("trades").eq("contract", contract).order("snapshot_minute", desc=True).limit(100).execute()
                     if response.data:
-                        trades_data = response.data[0].get('trades', [])
-                        if trades_data:
-                            df = pd.DataFrame(trades_data)
+                        all_trades = []
+                        for row in response.data:
+                            trades = row.get('trades', [])
+                            if trades and isinstance(trades, list):
+                                all_trades.extend(trades)
+                        
+                        if all_trades:
+                            df = pd.DataFrame(all_trades)
                             # Rename columns for clarity: p->price, q->volume, t->timestamp
                             df = df.rename(columns={'p': 'price', 'q': 'volume', 't': 'timestamp'})
+                            
+                            # Deduplicate based on timestamp and price to avoid overlaps if any
+                            if 'timestamp' in df.columns:
+                                df = df.drop_duplicates(subset=['timestamp', 'price'])
                             
                             # Convert types
                             df['price'] = pd.to_numeric(df['price'], errors='coerce')
@@ -571,8 +612,6 @@ with tab_history:
                             df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
                             
                             # Convert timestamp (Unix epoch in seconds)
-                            # Assuming 't' is in seconds. If it's huge, might be ms.
-                            # Sample: 1762268426.502 -> 2025... seems like seconds
                             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
                             
                             try:
@@ -589,7 +628,7 @@ with tab_history:
             @st.cache_data(ttl=60, show_spinner=False)
             def fetch_history_signals(contract):
                 try:
-                    response = supabase.table("signals").select("*").eq("contract", contract).order("snapshot_minute", desc=False).execute()
+                    response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=False).execute()
                     if response.data:
                         df = pd.DataFrame(response.data)
                         if 'snapshot_minute' in df.columns:
@@ -602,10 +641,23 @@ with tab_history:
                 except Exception as e:
                     print(f"Error fetching signal history for {contract}: {e}")
                 return pd.DataFrame()
+            
+            # 4. Fetch PTF from latest snapshot
+            @st.cache_data(ttl=60, show_spinner=False)
+            def fetch_ptf(contract):
+                try:
+                    response = supabase.table("snapshots").select("board").eq("contract", contract).order("snapshot_minute", desc=True).limit(1).execute()
+                    if response.data and response.data[0]:
+                        board = response.data[0].get('board', {})
+                        return board.get('mcp', None)
+                except Exception as e:
+                    print(f"Error fetching PTF for {contract}: {e}")
+                return None
 
             with st.spinner(f"Loading history for {selected_history_contract}..."):
                 price_df = fetch_snapshot_history(selected_history_contract)
                 signal_df = fetch_history_signals(selected_history_contract)
+                ptf = fetch_ptf(selected_history_contract)
             
             if not price_df.empty:
                 import plotly.graph_objects as go
@@ -701,6 +753,10 @@ with tab_history:
                 y_max = price_df['price'].max()
                 y_padding = (y_max - y_min) * 0.1 if y_max != y_min else y_max * 0.01
                 
+                # Add PTF horizontal line
+                if ptf:
+                    fig_hist.add_hline(y=ptf, line_dash="dash", line_color="yellow", annotation_text=f"PTF: {ptf:.2f}", annotation_position="right")
+                
                 # Update Layout for Premium Look
                 fig_hist.update_layout(
                     title=dict(
@@ -711,7 +767,7 @@ with tab_history:
                     xaxis=dict(
                         title="Time",
                         showgrid=False,
-                        rangeslider=dict(visible=True),
+                        rangeslider=dict(visible=False),
                         type="category", # Equal spacing
                         tickangle=45,
                         nticks=20
@@ -764,3 +820,419 @@ with tab_history:
             st.info("No history contracts found.")
 
     render_history_tab()
+
+with tab_snapshots:
+    @st.fragment
+    def render_snapshots_tab():
+        st.subheader("Market Snapshots")
+        
+        market_structure = fetch_market_structure()
+        
+        selected_snap_contract = None
+        selected_snap_minute = None
+        
+        if market_structure:
+            # Layout for selectors
+            col_date, col_contract, col_minute, col_btn = st.columns([1, 1, 1, 1])
+            
+            with col_date:
+                sorted_dates = sorted(market_structure.keys(), reverse=True)
+                selected_date = st.selectbox("Select Date", sorted_dates, key="snap_date")
+            
+            with col_contract:
+                if selected_date:
+                    available_contracts = sorted(market_structure[selected_date], reverse=False)
+                    selected_snap_contract = st.selectbox("Select Contract", available_contracts, key="snap_contract")
+            
+            with col_minute:
+                if selected_snap_contract:
+                    # Fetch available minutes for this contract
+                    @st.cache_data(ttl=60, show_spinner=False)
+                    def fetch_snapshot_minutes(contract):
+                        try:
+                            response = supabase.table("snapshots").select("snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=True).execute()
+                            if response.data:
+                                minutes = [row['snapshot_minute'] for row in response.data]
+                                return minutes
+                        except Exception as e:
+                            print(f"Error fetching snapshot minutes: {e}")
+                        return []
+
+                    available_minutes = fetch_snapshot_minutes(selected_snap_contract)
+                    
+                    # Format minutes for display (convert to Istanbul time)
+                    formatted_minutes = []
+                    minute_map = {}
+                    
+                    for m in available_minutes:
+                        try:
+                            dt = pd.to_datetime(m)
+                            try:
+                                dt = dt.tz_convert('Europe/Istanbul')
+                            except TypeError:
+                                dt = dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                            
+                            fmt = dt.strftime('%H:%M')
+                            formatted_minutes.append(fmt)
+                            minute_map[fmt] = m # Map display back to original value
+                        except:
+                            continue
+                            
+                    selected_snap_minute_fmt = st.selectbox("Select Minute", formatted_minutes, key="snap_minute")
+                    if selected_snap_minute_fmt:
+                        selected_snap_minute = minute_map.get(selected_snap_minute_fmt)
+
+            with col_btn:
+                st.write("") # Spacer
+                st.write("")
+                query_clicked = st.button("Query Snapshot", type="primary", use_container_width=True)
+        
+        if query_clicked and selected_snap_contract and selected_snap_minute:
+            with st.spinner("Fetching snapshot data..."):
+                # Fetch Data
+                try:
+                    response = supabase.table("snapshots").select("board, depth, trades, remaining_time_sec").eq("contract", selected_snap_contract).eq("snapshot_minute", selected_snap_minute).single().execute()
+                    
+                    if response.data:
+                        data = response.data
+                        board = data.get('board', {})
+                        depth = data.get('depth', {})
+                        trades = data.get('trades', [])
+                        remaining_time_sec = data.get('remaining_time_sec', 0)
+                        
+                        # --- Statistics Section ---
+                        st.markdown("---")
+                        
+                        # 1. Calculate Metrics
+                        
+                        # Snapshot Time
+                        snapshot_time_str = "N/A"
+                        try:
+                            st_dt = pd.to_datetime(selected_snap_minute)
+                            try:
+                                st_dt = st_dt.tz_convert('Europe/Istanbul')
+                            except TypeError:
+                                st_dt = st_dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                            snapshot_time_str = st_dt.strftime('%d %H:%M')
+                        except:
+                            pass
+                            
+                        # Remaining Time (HH:MM)
+                        remaining_time_str = "N/A"
+                        if remaining_time_sec is not None:
+                            hours = int(remaining_time_sec // 3600)
+                            minutes = int((remaining_time_sec % 3600) // 60)
+                            remaining_time_str = f"{hours:02d}:{minutes:02d}"
+                            
+                        # PTF (MCP)
+                        ptf = board.get('mcp', 0)
+                        
+                        # AOF (Average Price)
+                        aof = board.get('averagePrice', 0)
+                        
+                        # Imbalance
+                        imbalance_str = "N/A"
+                        bids = depth.get('bid', [])
+                        asks = depth.get('ask', [])
+                        
+                        total_bid_vol = 0
+                        total_ask_vol = 0
+                        
+                        if bids:
+                            df_bids_temp = pd.DataFrame(bids)
+                            if not df_bids_temp.empty:
+                                df_bids_temp = df_bids_temp.iloc[:, :2]
+                                df_bids_temp.columns = ['price', 'volume']
+                                total_bid_vol = pd.to_numeric(df_bids_temp['volume'], errors='coerce').sum()
+                        
+                        if asks:
+                            df_asks_temp = pd.DataFrame(asks)
+                            if not df_asks_temp.empty:
+                                df_asks_temp = df_asks_temp.iloc[:, :2]
+                                df_asks_temp.columns = ['price', 'volume']
+                                total_ask_vol = pd.to_numeric(df_asks_temp['volume'], errors='coerce').sum()
+                                
+                        if (total_bid_vol + total_ask_vol) > 0:
+                            imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
+                            imbalance_str = f"{imbalance:.2%}"
+                            
+                        # Price Change (Weighted Avg of last 50MWh - PTF)
+                        price_change_str = "N/A"
+                        if trades and ptf:
+                            df_trades_calc = pd.DataFrame(trades)
+                            df_trades_calc = df_trades_calc.rename(columns={'p': 'price', 'q': 'volume', 't': 'timestamp'})
+                            df_trades_calc['price'] = pd.to_numeric(df_trades_calc['price'], errors='coerce')
+                            df_trades_calc['volume'] = pd.to_numeric(df_trades_calc['volume'], errors='coerce')
+                            df_trades_calc['timestamp'] = pd.to_numeric(df_trades_calc['timestamp'], errors='coerce')
+                            
+                            # Sort by timestamp descending (latest first)
+                            df_trades_calc = df_trades_calc.sort_values('timestamp', ascending=False)
+                            
+                            cumulative_vol = 0
+                            weighted_sum = 0
+                            
+                            for index, row in df_trades_calc.iterrows():
+                                vol = row['volume']
+                                price = row['price']
+                                
+                                if pd.isna(vol) or pd.isna(price):
+                                    continue
+                                    
+                                needed = 50 - cumulative_vol
+                                if needed <= 0:
+                                    break
+                                    
+                                take = min(vol, needed)
+                                weighted_sum += take * price
+                                cumulative_vol += take
+                                
+                            if cumulative_vol > 0:
+                                weighted_avg = weighted_sum / cumulative_vol
+                                price_change = weighted_avg - ptf
+                                price_change_str = f"{price_change:.2f}"
+                        
+                        # Display Metrics
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
+                        m1.metric("Snapshot Time", snapshot_time_str)
+                        m2.metric("Remaining Time", remaining_time_str)
+                        m3.metric("PTF", f"{ptf:.2f}" if isinstance(ptf, (int, float)) else ptf)
+                        m4.metric("AOF", f"{aof:.2f}" if isinstance(aof, (int, float)) else aof)
+                        m5.metric("Imbalance", imbalance_str)
+                        m6.metric("Price Change", price_change_str)
+                        
+                        st.markdown("---")
+                        
+                        # --- Layout ---
+                        col_left, col_right = st.columns([2, 1])
+                        
+                        # --- Left Column: Trades ---
+                        with col_left:
+                            st.markdown("### Trades")
+                            
+                            if trades:
+                                df_trades = pd.DataFrame(trades)
+                                # Rename columns: p->price, q->volume, t->timestamp
+                                df_trades = df_trades.rename(columns={'p': 'price', 'q': 'volume', 't': 'timestamp'})
+                                
+                                # Process timestamp
+                                df_trades['timestamp'] = pd.to_numeric(df_trades['timestamp'], errors='coerce')
+                                df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
+                                df_trades['volume'] = pd.to_numeric(df_trades['volume'], errors='coerce')
+                                
+                                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s')
+                                try:
+                                    df_trades['timestamp'] = df_trades['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                                except TypeError:
+                                    df_trades['timestamp'] = df_trades['timestamp'].dt.tz_convert('Europe/Istanbul')
+                                
+                                df_trades = df_trades.sort_values('timestamp', ascending=False)
+                                df_trades['formatted_time'] = df_trades['timestamp'].dt.strftime('%d:%m %H:%M:%S')
+
+                                # Plotly Combo Chart
+                                import plotly.graph_objects as go
+                                from plotly.subplots import make_subplots
+                                
+                                fig_trades = make_subplots(specs=[[{"secondary_y": True}]])
+                                
+                                # Volume Bar
+                                fig_trades.add_trace(go.Bar(
+                                    x=df_trades['formatted_time'],
+                                    y=df_trades['volume'],
+                                    name='Volume',
+                                    marker_color='rgba(128, 128, 128, 0.5)',
+                                    opacity=0.6
+                                ), secondary_y=True)
+                                
+                                # Price Line
+                                fig_trades.add_trace(go.Scatter(
+                                    x=df_trades['formatted_time'],
+                                    y=df_trades['price'],
+                                    mode='lines',
+                                    name='Price',
+                                    line=dict(color='#00BFFF', width=2),
+                                    fill='tozeroy',
+                                    fillcolor='rgba(0, 191, 255, 0.1)'
+                                ), secondary_y=False)
+                                
+                                # Calculate dynamic Y-axis range
+                                y_min = df_trades['price'].min()
+                                y_max = df_trades['price'].max()
+                                y_padding = (y_max - y_min) * 0.1 if y_max != y_min else y_max * 0.01
+                                
+                                # Add PTF horizontal line
+                                if ptf:
+                                    fig_trades.add_hline(y=ptf, line_dash="dash", line_color="yellow", annotation_text=f"PTF: {ptf:.2f}", annotation_position="right")
+                                
+                                fig_trades.update_layout(
+                                    title=dict(
+                                        text=f"Price Action: {selected_snap_contract}",
+                                        font=dict(size=20, color='white')
+                                    ),
+                                    template="plotly_dark",
+                                    xaxis=dict(
+                                        title="Time",
+                                        showgrid=False,
+                                        rangeslider=dict(visible=False),
+                                        type="category",
+                                        tickangle=45,
+                                        nticks=20
+                                    ),
+                                    yaxis=dict(
+                                        title="Price",
+                                        showgrid=True,
+                                        gridcolor='rgba(255, 255, 255, 0.1)',
+                                        zeroline=False,
+                                        range=[y_min - y_padding, y_max + y_padding]
+                                    ),
+                                    yaxis2=dict(
+                                        title="Volume",
+                                        showgrid=False,
+                                        zeroline=False,
+                                        showticklabels=False,
+                                        overlaying="y",
+                                        side="right"
+                                    ),
+                                    height=700,
+                                    hovermode="x unified",
+                                    legend=dict(
+                                        orientation="h",
+                                        yanchor="bottom",
+                                        y=1.02,
+                                        xanchor="right",
+                                        x=1
+                                    ),
+                                    margin=dict(l=20, r=20, t=60, b=20),
+                                    plot_bgcolor='rgba(0,0,0,0)',
+                                    paper_bgcolor='rgba(0,0,0,0)'
+                                )
+                                st.plotly_chart(fig_trades, use_container_width=True)
+                                
+                                # Trades Table
+                                st.dataframe(df_trades[['formatted_time', 'price', 'volume']], use_container_width=True, height=300)
+                            else:
+                                st.info("No trades found for this snapshot.")
+
+                        # --- Right Column: Depth ---
+                        with col_right:
+                            st.markdown("### Market Depth")
+                            
+                            mcp = board.get('mcp')
+                            
+                            bids = depth.get('bid', []) # Buyers (Green)
+                            asks = depth.get('ask', []) # Sellers (Red)
+                            
+                            if bids or asks:
+                                # Process Bids
+                                if bids:
+                                    df_bids = pd.DataFrame(bids)
+                                    df_bids = df_bids.iloc[:, :2]
+                                    df_bids.columns = ['price', 'volume']
+                                    df_bids['price'] = pd.to_numeric(df_bids['price'], errors='coerce')
+                                    df_bids['volume'] = pd.to_numeric(df_bids['volume'], errors='coerce')
+                                    df_bids = df_bids.sort_values('price', ascending=False) # High to Low
+                                    df_bids['cumulative_volume'] = df_bids['volume'].cumsum()
+                                else:
+                                    df_bids = pd.DataFrame(columns=['price', 'volume', 'cumulative_volume'])
+                                
+                                # Process Asks
+                                if asks:
+                                    df_asks = pd.DataFrame(asks)
+                                    df_asks = df_asks.iloc[:, :2]
+                                    df_asks.columns = ['price', 'volume']
+                                    df_asks['price'] = pd.to_numeric(df_asks['price'], errors='coerce')
+                                    df_asks['volume'] = pd.to_numeric(df_asks['volume'], errors='coerce')
+                                    df_asks = df_asks.sort_values('price', ascending=True) # Low to High
+                                    df_asks['cumulative_volume'] = df_asks['volume'].cumsum()
+                                else:
+                                    df_asks = pd.DataFrame(columns=['price', 'volume', 'cumulative_volume'])
+                                
+                                # Plotly Depth Chart
+                                fig_depth = go.Figure()
+                                
+                                # Bids Area (Green)
+                                if not df_bids.empty:
+                                    fig_depth.add_trace(go.Scatter(
+                                        x=df_bids['price'],
+                                        y=df_bids['cumulative_volume'],
+                                        mode='lines',
+                                        name='Bids',
+                                        fill='tozeroy',
+                                        line=dict(color='#28a745'), # Green
+                                        fillcolor='rgba(40, 167, 69, 0.2)'
+                                    ))
+                                
+                                # Asks Area (Red)
+                                if not df_asks.empty:
+                                    fig_depth.add_trace(go.Scatter(
+                                        x=df_asks['price'],
+                                        y=df_asks['cumulative_volume'],
+                                        mode='lines',
+                                        name='Asks',
+                                        fill='tozeroy',
+                                        line=dict(color='#dc3545'), # Red
+                                        fillcolor='rgba(220, 53, 69, 0.2)'
+                                    ))
+                                
+                                # MCP Line
+                                if mcp:
+                                    fig_depth.add_vline(x=mcp, line_dash="dash", line_color="white", annotation_text=f"MCP: {mcp}")
+                                
+                                fig_depth.update_layout(
+                                    template="plotly_dark",
+                                    height=500,
+                                    margin=dict(l=10, r=10, t=30, b=10),
+                                    xaxis_title="Price",
+                                    yaxis_title="Cumulative Volume",
+                                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right")
+                                )
+                                st.plotly_chart(fig_depth, use_container_width=True)
+                                
+                                # Unified Depth Table
+                                # Structure: Alış (Hacim, Fiyat) | Satış (Fiyat, Hacim)
+                                
+                                # Reset index to align rows
+                                df_bids_disp = df_bids[['volume', 'price']].reset_index(drop=True)
+                                df_asks_disp = df_asks[['price', 'volume']].reset_index(drop=True)
+                                
+                                # Combine into one DataFrame
+                                df_combined = pd.concat([df_bids_disp, df_asks_disp], axis=1)
+                                
+                                # Create MultiIndex Columns
+                                df_combined.columns = pd.MultiIndex.from_tuples([
+                                    ('Alış', 'Hacim'), ('Alış', 'Fiyat'),
+                                    ('Satış', 'Fiyat'), ('Satış', 'Hacim')
+                                ])
+                                
+                                # Apply Styling
+                                def highlight_depth(row):
+                                    styles = [''] * 4
+                                    # Alış Columns (0, 1) - Very Subtle Green
+                                    if pd.notna(row[('Alış', 'Fiyat')]):
+                                        # Very dark green background, standard green text
+                                        styles[0] = 'background-color: #0e2a15; color: #4caf50' 
+                                        styles[1] = 'background-color: #0e2a15; color: #4caf50'
+                                    
+                                    # Satış Columns (2, 3) - Very Subtle Red
+                                    if pd.notna(row[('Satış', 'Fiyat')]):
+                                        # Very dark red background, standard red text
+                                        styles[2] = 'background-color: #2a0e0e; color: #ff5252'
+                                        styles[3] = 'background-color: #2a0e0e; color: #ff5252'
+                                        
+                                    return styles
+
+                                
+                                st.dataframe(
+                                    df_combined.style.apply(highlight_depth, axis=1).format("{:.2f}"), 
+                                    use_container_width=True, 
+                                    height=500
+                                )
+                                
+                            else:
+                                st.info("No depth data found.")
+
+                    else:
+                        st.warning("No data found for the selected snapshot.")
+                except Exception as e:
+                    st.error(f"Error fetching snapshot: {e}")
+
+    render_snapshots_tab()
