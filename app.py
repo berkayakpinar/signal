@@ -42,9 +42,6 @@ def get_next_refresh_interval():
     seconds_until = (next_refresh - now).total_seconds()
     return max(1000, int(seconds_until * 1000))
 
-refresh_interval = get_next_refresh_interval()
-st_autorefresh(interval=refresh_interval, key="dynamic_refresh")
-
 # Load environment variables
 load_dotenv()
 
@@ -232,8 +229,8 @@ top_col1, top_col2 = st.columns([3, 1])
 
 with top_col1:
     st.title("Signal Reader")
-    # st_autorefresh removed (handled globally)
     st.write(f"Last Updated: {datetime.now(istanbul_tz).strftime('%Y-%m-%d %H:%M:%S')}")
+    auto_refresh = st.toggle("Auto Refresh", value=True)
 
 with top_col2:
     st.markdown(
@@ -245,6 +242,10 @@ with top_col2:
         """,
         unsafe_allow_html=True
     )
+
+if auto_refresh:
+    refresh_interval = get_next_refresh_interval()
+    st_autorefresh(interval=refresh_interval, key="dynamic_refresh")
 
 # Define styling function
 def color_trade_signal(val):
@@ -267,7 +268,7 @@ def format_time_signal(val):
 
 # Create Tabs
 # Create Tabs
-tab_dashboard, tab_timeline, tab_history, tab_snapshots = st.tabs(["Dashboard", "Timeline", "History", "Snapshots"])
+tab_dashboard, tab_timeline, tab_snapshots = st.tabs(["Dashboard", "Timeline", "Snapshots"])
 
 with tab_dashboard:
     if active_contracts:
@@ -562,279 +563,23 @@ with tab_timeline:
     else:
         st.info("No recent trade signals found.")
 
-with tab_history:
-    @st.fragment
-    def render_history_tab():
-        st.subheader("Contract History Analysis")
-        
-        # 1. Fetch Market Structure (Dates & Contracts)
-        market_structure = fetch_market_structure()
-        
-        selected_history_contract = None
-        
-        if market_structure:
-            # Step 1: Select Date (from cached structure keys)
-            sorted_dates = sorted(market_structure.keys(), reverse=True)
-            selected_date = st.selectbox("Select Date", sorted_dates)
-            
-            # Step 2: Select Contract (from cached structure values)
-            if selected_date:
-                # Sort contracts ascending (small to large)
-                available_contracts = sorted(market_structure[selected_date], reverse=False)
-                selected_history_contract = st.selectbox("Select Contract", available_contracts)
-                
-        if selected_history_contract:
-            # 2. Fetch Snapshot Data (Price History from Trades)
-            @st.cache_data(ttl=60, show_spinner=False)
-            def fetch_snapshot_history(contract):
-                try:
-                    # Fetch last 100 snapshots to ensure we get history even if recent minutes are empty
-                    # This also builds a better chart than just 1 minute of data
-                    response = supabase.table("snapshots").select("trades").eq("contract", contract).order("snapshot_minute", desc=True).limit(100).execute()
-                    if response.data:
-                        all_trades = []
-                        for row in response.data:
-                            trades = row.get('trades', [])
-                            if trades and isinstance(trades, list):
-                                all_trades.extend(trades)
-                        
-                        if all_trades:
-                            df = pd.DataFrame(all_trades)
-                            # Rename columns for clarity: p->price, q->volume, t->timestamp
-                            df = df.rename(columns={'p': 'price', 'q': 'volume', 't': 'timestamp'})
-                            
-                            # Deduplicate based on timestamp and price to avoid overlaps if any
-                            if 'timestamp' in df.columns:
-                                df = df.drop_duplicates(subset=['timestamp', 'price'])
-                            
-                            # Convert types
-                            df['price'] = pd.to_numeric(df['price'], errors='coerce')
-                            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-                            df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
-                            
-                            # Convert timestamp (Unix epoch in seconds)
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                            
-                            try:
-                                df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
-                            except TypeError:
-                                df['timestamp'] = df['timestamp'].dt.tz_convert('Europe/Istanbul')
-                                
-                            return df.sort_values('timestamp')
-                except Exception as e:
-                    print(f"Error fetching snapshot history for {contract}: {e}")
-                return pd.DataFrame()
 
-            # 3. Fetch Signal Data (Overlay)
-            @st.cache_data(ttl=60, show_spinner=False)
-            def fetch_history_signals(contract):
-                try:
-                    response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=False).execute()
-                    if response.data:
-                        df = pd.DataFrame(response.data)
-                        if 'snapshot_minute' in df.columns:
-                            df['snapshot_minute'] = pd.to_datetime(df['snapshot_minute'])
-                            try:
-                                df['snapshot_minute'] = df['snapshot_minute'].dt.tz_convert('Europe/Istanbul')
-                            except TypeError:
-                                df['snapshot_minute'] = df['snapshot_minute'].dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
-                        return df
-                except Exception as e:
-                    print(f"Error fetching signal history for {contract}: {e}")
-                return pd.DataFrame()
-            
-            # 4. Fetch PTF from latest snapshot
-            @st.cache_data(ttl=60, show_spinner=False)
-            def fetch_ptf(contract):
-                try:
-                    response = supabase.table("snapshots").select("board").eq("contract", contract).order("snapshot_minute", desc=True).limit(1).execute()
-                    if response.data and response.data[0]:
-                        board = response.data[0].get('board', {})
-                        return board.get('mcp', None)
-                except Exception as e:
-                    print(f"Error fetching PTF for {contract}: {e}")
-                return None
-
-            with st.spinner(f"Loading history for {selected_history_contract}..."):
-                price_df = fetch_snapshot_history(selected_history_contract)
-                signal_df = fetch_history_signals(selected_history_contract)
-                ptf = fetch_ptf(selected_history_contract)
-            
-            if not price_df.empty:
-                import plotly.graph_objects as go
-                from plotly.subplots import make_subplots
-                
-                # Format timestamp for X-axis labels (dd:mm hh:mm:ss)
-                price_df['formatted_time'] = price_df['timestamp'].dt.strftime('%d:%m %H:%M:%S')
-                
-                # Create Figure with Secondary Y-Axis
-                fig_hist = make_subplots(specs=[[{"secondary_y": True}]])
-                
-                # Add Volume Bar (Secondary Axis)
-                fig_hist.add_trace(go.Bar(
-                    x=price_df['formatted_time'],
-                    y=price_df['volume'],
-                    name='Volume',
-                    marker_color='rgba(128, 128, 128, 0.5)', # Gray with opacity
-                    opacity=0.6
-                ), secondary_y=True)
-
-                # Add Price Line (Primary Axis)
-                fig_hist.add_trace(go.Scatter(
-                    x=price_df['formatted_time'],
-                    y=price_df['price'],
-                    mode='lines',
-                    name='Price',
-                    line=dict(color='#00BFFF', width=2), # Deep Sky Blue
-                    fill='tozeroy',
-                    fillcolor='rgba(0, 191, 255, 0.1)' # Transparent Blue Fill
-                ), secondary_y=False)
-                
-                # Add Signal Overlay
-                if not signal_df.empty:
-                    # Filter for actual trades
-                    trades = signal_df[signal_df['tradeSignal'].isin(['OPEN_LONG', 'OPEN_SHORT'])]
-                    
-                    if not trades.empty:
-                        trades = trades.sort_values('snapshot_minute')
-                        price_df = price_df.sort_values('timestamp')
-                        
-                        # Use merge_asof to find the nearest price for each trade
-                        # Note: signal time is 'snapshot_minute', price time is 'timestamp'
-                        merged_trades = pd.merge_asof(
-                            trades, 
-                            price_df, 
-                            left_on='snapshot_minute',
-                            right_on='timestamp',
-                            direction='nearest',
-                            tolerance=pd.Timedelta('5min')
-                        )
-                        
-                        # Format timestamp for matched trades to align with x-axis
-                        merged_trades['formatted_time'] = merged_trades['timestamp'].dt.strftime('%d:%m %H:%M:%S')
-                        
-                        # Separate Long and Short for colors
-                        longs = merged_trades[merged_trades['tradeSignal'] == 'OPEN_LONG']
-                        shorts = merged_trades[merged_trades['tradeSignal'] == 'OPEN_SHORT']
-                        
-                        if not longs.empty:
-                            fig_hist.add_trace(go.Scatter(
-                                x=longs['formatted_time'], # Use the formatted time
-                                y=longs['price'],
-                                mode='markers',
-                                name='OPEN_LONG',
-                                marker=dict(
-                                    color='#FF4B4B', # Streamlit Red
-                                    size=18, 
-                                    symbol='triangle-up',
-                                    line=dict(width=2, color='white')
-                                ),
-                                hovertemplate='<b>OPEN_LONG</b><br>Time: %{x}<br>Price: %{y}<br>Signal: %{customdata:.2f}<extra></extra>',
-                                customdata=longs['timeSignal']
-                            ), secondary_y=False)
-                            
-                        if not shorts.empty:
-                            fig_hist.add_trace(go.Scatter(
-                                x=shorts['formatted_time'],
-                                y=shorts['price'],
-                                mode='markers',
-                                name='OPEN_SHORT',
-                                marker=dict(
-                                    color='#00CC96', # Bright Green
-                                    size=18, 
-                                    symbol='triangle-down',
-                                    line=dict(width=2, color='white')
-                                ),
-                                hovertemplate='<b>OPEN_SHORT</b><br>Time: %{x}<br>Price: %{y}<br>Signal: %{customdata:.2f}<extra></extra>',
-                                customdata=shorts['timeSignal']
-                            ), secondary_y=False)
-
-                # Calculate dynamic Y-axis range
-                y_min = price_df['price'].min()
-                y_max = price_df['price'].max()
-                y_padding = (y_max - y_min) * 0.1 if y_max != y_min else y_max * 0.01
-                
-                # Add PTF horizontal line
-                if ptf:
-                    fig_hist.add_hline(y=ptf, line_dash="dash", line_color="yellow", annotation_text=f"PTF: {ptf:.2f}", annotation_position="right")
-                
-                # Update Layout for Premium Look
-                fig_hist.update_layout(
-                    title=dict(
-                        text=f"Price Action & Signals: {selected_history_contract}",
-                        font=dict(size=20, color='white')
-                    ),
-                    template="plotly_dark",
-                    xaxis=dict(
-                        title="Time",
-                        showgrid=False,
-                        rangeslider=dict(visible=False),
-                        type="category", # Equal spacing
-                        tickangle=45,
-                        nticks=20
-                    ),
-                    yaxis=dict(
-                        title="Price",
-                        showgrid=True,
-                        gridcolor='rgba(255, 255, 255, 0.1)',
-                        zeroline=False,
-                        range=[y_min - y_padding, y_max + y_padding] # Dynamic range
-                    ),
-                    yaxis2=dict(
-                        title="Volume",
-                        showgrid=False,
-                        zeroline=False,
-                        showticklabels=False, # Hide volume labels to keep it clean
-                        overlaying="y",
-                        side="right"
-                    ),
-                    height=700,
-                    hovermode="x unified",
-                    legend=dict(
-                        orientation="h",
-                        yanchor="bottom",
-                        y=1.02,
-                        xanchor="right",
-                        x=1
-                    ),
-                    margin=dict(l=20, r=20, t=60, b=20),
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)'
-                )
-                
-                st.plotly_chart(fig_hist, use_container_width=True)
-                
-                # Show raw data toggle
-                if st.checkbox("Show Raw Data"):
-                    col_d1, col_d2 = st.columns(2)
-                    with col_d1:
-                        st.write("Price Data")
-                        st.dataframe(price_df, use_container_width=True)
-                    with col_d2:
-                        st.write("Signal Data")
-                        st.dataframe(signal_df, use_container_width=True)
-
-            else:
-                st.warning(f"No price history found for {selected_history_contract}")
-        
-        else:
-            st.info("No history contracts found.")
-
-    render_history_tab()
 
 with tab_snapshots:
     @st.fragment
     def render_snapshots_tab():
-        st.subheader("Market Snapshots")
+        # st.subheader("Market Snapshots") removed
         
         market_structure = fetch_market_structure()
         
         selected_snap_contract = None
         selected_snap_minute = None
         
+        available_minutes = []
+
         if market_structure:
             # Layout for selectors
-            col_date, col_contract, col_minute, col_btn = st.columns([1, 1, 1, 1])
+            col_date, col_contract = st.columns([1, 1])
             
             with col_date:
                 sorted_dates = sorted(market_structure.keys(), reverse=True)
@@ -845,63 +590,78 @@ with tab_snapshots:
                     available_contracts = sorted(market_structure[selected_date], reverse=False)
                     selected_snap_contract = st.selectbox("Select Contract", available_contracts, key="snap_contract")
             
-            with col_minute:
-                if selected_snap_contract:
-                    # Fetch available minutes for this contract
-                    @st.cache_data(ttl=60, show_spinner=False)
-                    def fetch_snapshot_minutes(contract):
-                        try:
-                            response = supabase.table("snapshots").select("snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=True).execute()
-                            if response.data:
-                                minutes = [row['snapshot_minute'] for row in response.data]
-                                return minutes
-                        except Exception as e:
-                            print(f"Error fetching snapshot minutes: {e}")
-                        return []
+            if selected_snap_contract:
+                # Fetch available minutes for this contract
+                @st.cache_data(ttl=60, show_spinner=False)
+                def fetch_snapshot_minutes(contract):
+                    try:
+                        response = supabase.table("snapshots").select("snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=True).execute()
+                        if response.data:
+                            minutes = [row['snapshot_minute'] for row in response.data]
+                            return minutes
+                    except Exception as e:
+                        print(f"Error fetching snapshot minutes: {e}")
+                    return []
 
-                    available_minutes = fetch_snapshot_minutes(selected_snap_contract)
-                    
-                    # Format minutes for display (convert to Istanbul time)
-                    formatted_minutes = []
-                    minute_map = {}
-                    
-                    for m in available_minutes:
-                        try:
-                            dt = pd.to_datetime(m)
-                            try:
-                                dt = dt.tz_convert('Europe/Istanbul')
-                            except TypeError:
-                                dt = dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
-                            
-                            fmt = dt.strftime('%H:%M')
-                            formatted_minutes.append(fmt)
-                            minute_map[fmt] = m # Map display back to original value
-                        except:
-                            continue
-                            
-                    selected_snap_minute_fmt = st.selectbox("Select Minute", formatted_minutes, key="snap_minute")
-                    if selected_snap_minute_fmt:
-                        selected_snap_minute = minute_map.get(selected_snap_minute_fmt)
+                available_minutes = fetch_snapshot_minutes(selected_snap_contract)
 
-            with col_btn:
-                st.write("") # Spacer
-                st.write("")
-                query_clicked = st.button("Query Snapshot", type="primary", use_container_width=True)
+                # Create mapping from HH:MM to full timestamp
+                minute_map = {}
+                for m in available_minutes:
+                    try:
+                        dt = pd.to_datetime(m)
+                        try:
+                            dt = dt.tz_convert('Europe/Istanbul')
+                        except TypeError:
+                            dt = dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                        
+                        fmt = dt.strftime('%d %H:%M')
+                        minute_map[fmt] = m
+                    except:
+                        continue
+
+                # Initialize or Update Session State for Minute
+                # If contract changed, reset minute to latest
+                if 'snap_query_contract' not in st.session_state or st.session_state.snap_query_contract != selected_snap_contract:
+                    st.session_state.snap_query_contract = selected_snap_contract
+                    if available_minutes:
+                        st.session_state.snap_query_minute = available_minutes[0]
+                    else:
+                        st.session_state.snap_query_minute = None
+                
+                selected_snap_minute = st.session_state.snap_query_minute
         
-        if query_clicked and selected_snap_contract and selected_snap_minute:
+        # Check if we have a valid query
+        if selected_snap_contract and selected_snap_minute:
+            
+
             with st.spinner("Fetching snapshot data..."):
                 # Fetch Data
                 try:
-                    response = supabase.table("snapshots").select("board, depth, trades, remaining_time_sec").eq("contract", selected_snap_contract).eq("snapshot_minute", selected_snap_minute).single().execute()
+                    # Fetch Specific Snapshot Data (Board, Depth, Remaining Time)
+                    response = supabase.table("snapshots").select("board, depth, remaining_time_sec").eq("contract", selected_snap_contract).eq("snapshot_minute", selected_snap_minute).single().execute()
+                    
+                    # Fetch Latest Snapshot Data (Trades) - Get up to 10 snapshots to find one with trades
+                    latest_response = supabase.table("snapshots").select("trades").eq("contract", selected_snap_contract).order("snapshot_minute", desc=True).limit(10).execute()
                     
                     if response.data:
                         data = response.data
                         board = data.get('board', {})
                         depth = data.get('depth', {})
-                        trades = data.get('trades', [])
                         remaining_time_sec = data.get('remaining_time_sec', 0)
                         
+                        # Use trades from the latest snapshot that has non-empty trades
+                        trades = []
+                        if latest_response.data and len(latest_response.data) > 0:
+                            # Loop through snapshots to find the first one with trades
+                            for snapshot in latest_response.data:
+                                trades_data = snapshot.get('trades')
+                                if trades_data is not None and isinstance(trades_data, list) and len(trades_data) > 0:
+                                    trades = trades_data
+                                    break
+                        
                         # --- Statistics Section ---
+                        st.markdown(f"<h3 style='text-align: center;'>{selected_snap_contract}</h3>", unsafe_allow_html=True)
                         st.markdown("---")
                         
                         # 1. Calculate Metrics
@@ -921,9 +681,16 @@ with tab_snapshots:
                         # Remaining Time (HH:MM)
                         remaining_time_str = "N/A"
                         if remaining_time_sec is not None:
-                            hours = int(remaining_time_sec // 3600)
-                            minutes = int((remaining_time_sec % 3600) // 60)
-                            remaining_time_str = f"{hours:02d}:{minutes:02d}"
+                            try:
+                                val = float(remaining_time_sec)
+                                if val < 60:
+                                    remaining_time_str = "00:00"
+                                else:
+                                    hours = int(val // 3600)
+                                    minutes = int((val % 3600) // 60)
+                                    remaining_time_str = f"{hours:02d}:{minutes:02d}"
+                            except:
+                                pass
                             
                         # PTF (MCP)
                         ptf = board.get('mcp', 0)
@@ -966,6 +733,22 @@ with tab_snapshots:
                             df_trades_calc['volume'] = pd.to_numeric(df_trades_calc['volume'], errors='coerce')
                             df_trades_calc['timestamp'] = pd.to_numeric(df_trades_calc['timestamp'], errors='coerce')
                             
+                            # Filter trades to include only those before or at the snapshot time
+                            try:
+                                snap_dt = pd.to_datetime(selected_snap_minute)
+                                if snap_dt.tzinfo is None:
+                                    snap_dt = snap_dt.tz_localize('UTC')
+                                else:
+                                    snap_dt = snap_dt.tz_convert('UTC')
+                                
+                                # Create temp datetime column for filtering (UTC)
+                                df_trades_calc['dt_utc'] = pd.to_datetime(df_trades_calc['timestamp'], unit='s', utc=True)
+                                
+                                # Filter
+                                df_trades_calc = df_trades_calc[df_trades_calc['dt_utc'] <= snap_dt]
+                            except Exception as e:
+                                print(f"Error filtering trades for price change: {e}")
+                            
                             # Sort by timestamp descending (latest first)
                             df_trades_calc = df_trades_calc.sort_values('timestamp', ascending=False)
                             
@@ -994,12 +777,12 @@ with tab_snapshots:
                         
                         # Display Metrics
                         m1, m2, m3, m4, m5, m6 = st.columns(6)
-                        m1.metric("Snapshot Time", snapshot_time_str)
-                        m2.metric("Remaining Time", remaining_time_str)
-                        m3.metric("PTF", f"{ptf:.2f}" if isinstance(ptf, (int, float)) else ptf)
-                        m4.metric("AOF", f"{aof:.2f}" if isinstance(aof, (int, float)) else aof)
-                        m5.metric("Imbalance", imbalance_str)
-                        m6.metric("Price Change", price_change_str)
+                        m1.metric("Snapshot Time", snapshot_time_str, help="Verinin kaydedildiği an.")
+                        m2.metric("Remaining Time", remaining_time_str, help="Kontrat kapanışına kalan süre (HH:MM)")
+                        m3.metric("PTF", f"{ptf:.2f}" if isinstance(ptf, (int, float)) else ptf, help="Piyasa Takas Fiyatı")
+                        m4.metric("AOF", f"{aof:.2f}" if isinstance(aof, (int, float)) else aof, help="Seçilen ana kadar gerçekleşen eşleşmelerin ağırlıklı ortalama fiyatı")
+                        m5.metric("Hacim Dengesi", imbalance_str, help="Alıcı ve Satıcı hacmi arasındaki dengesizlik (Sıfır dengede. Pozitifse Alıcı baskın, Negatifse Satıcı baskın)")
+                        m6.metric("Fiyat Değişimi", price_change_str, help="Son 50MWh hacimli eşleşmenin ağırlıklı ortalama fiyatının PTF'den farkı")
                         
                         st.markdown("---")
                         
@@ -1008,7 +791,7 @@ with tab_snapshots:
                         
                         # --- Left Column: Trades ---
                         with col_left:
-                            st.markdown("### Trades")
+                            st.markdown(f"### Trades ({selected_snap_contract})")
                             
                             if trades:
                                 df_trades = pd.DataFrame(trades)
@@ -1026,8 +809,60 @@ with tab_snapshots:
                                 except TypeError:
                                     df_trades['timestamp'] = df_trades['timestamp'].dt.tz_convert('Europe/Istanbul')
                                 
-                                df_trades = df_trades.sort_values('timestamp', ascending=False)
-                                df_trades['formatted_time'] = df_trades['timestamp'].dt.strftime('%d:%m %H:%M:%S')
+                                # Sort Ascending (Oldest to Newest) for Graph
+                                df_trades = df_trades.sort_values('timestamp', ascending=True)
+                                df_trades['formatted_time'] = df_trades['timestamp'].dt.strftime('%d:%m %H:%M')
+                                
+                                # Fetch Signals for Overlay
+                                @st.cache_data(ttl=60, show_spinner=False)
+                                def fetch_snap_signals(contract):
+                                    try:
+                                        response = supabase.table("signals").select("contract, tradeSignal, timeSignal, snapshot_minute").eq("contract", contract).order("snapshot_minute", desc=False).execute()
+                                        if response.data:
+                                            df = pd.DataFrame(response.data)
+                                            if 'snapshot_minute' in df.columns:
+                                                df['snapshot_minute'] = pd.to_datetime(df['snapshot_minute'])
+                                                try:
+                                                    df['snapshot_minute'] = df['snapshot_minute'].dt.tz_convert('Europe/Istanbul')
+                                                except TypeError:
+                                                    df['snapshot_minute'] = df['snapshot_minute'].dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                                            return df
+                                    except Exception as e:
+                                        print(f"Error fetching signal history for {contract}: {e}")
+                                    return pd.DataFrame()
+
+                                signal_df = fetch_snap_signals(selected_snap_contract)
+
+                                # Add 'snapshot' column (Next Snapshot Minute) BEFORE Charting
+                                if available_minutes:
+                                    try:
+                                        df_snaps = pd.DataFrame({'snap_min': available_minutes})
+                                        df_snaps['snap_min'] = pd.to_datetime(df_snaps['snap_min'])
+                                        try:
+                                            df_snaps['snap_min'] = df_snaps['snap_min'].dt.tz_convert('Europe/Istanbul')
+                                        except TypeError:
+                                            df_snaps['snap_min'] = df_snaps['snap_min'].dt.tz_localize('UTC').dt.tz_convert('Europe/Istanbul')
+                                        
+                                        df_snaps = df_snaps.sort_values('snap_min')
+                                        
+                                        # Merge to find next snapshot (direction='forward')
+                                        df_trades = pd.merge_asof(
+                                            df_trades,
+                                            df_snaps,
+                                            left_on='timestamp',
+                                            right_on='snap_min',
+                                            direction='forward'
+                                        )
+                                        
+                                        if 'snap_min' in df_trades.columns:
+                                            df_trades['snapshot'] = df_trades['snap_min'].dt.strftime('%d %H:%M')
+                                        else:
+                                            df_trades['snapshot'] = "-"
+                                    except Exception as e:
+                                        print(f"Error adding snapshot column: {e}")
+                                        df_trades['snapshot'] = "-"
+                                else:
+                                    df_trades['snapshot'] = "-"
 
                                 # Plotly Combo Chart
                                 import plotly.graph_objects as go
@@ -1052,8 +887,67 @@ with tab_snapshots:
                                     name='Price',
                                     line=dict(color='#00BFFF', width=2),
                                     fill='tozeroy',
-                                    fillcolor='rgba(0, 191, 255, 0.1)'
+                                    fillcolor='rgba(0, 191, 255, 0.1)',
+                                    customdata=df_trades['snapshot'],
+                                    hovertemplate='<b>Price</b><br>Time: %{x}<br>Price: %{y}<br>Snapshot: %{customdata}<extra></extra>'
                                 ), secondary_y=False)
+
+                                # Add Signal Overlay
+                                if not signal_df.empty:
+                                    # Filter for actual trades
+                                    sig_trades = signal_df[signal_df['tradeSignal'].isin(['OPEN_LONG', 'OPEN_SHORT'])]
+                                    
+                                    if not sig_trades.empty:
+                                        sig_trades = sig_trades.sort_values('snapshot_minute')
+                                        
+                                        # Use merge_asof to find the nearest price for each trade
+                                        merged_trades = pd.merge_asof(
+                                            sig_trades, 
+                                            df_trades, 
+                                            left_on='snapshot_minute',
+                                            right_on='timestamp',
+                                            direction='nearest',
+                                            tolerance=pd.Timedelta('5min')
+                                        )
+                                        
+                                        # Format timestamp for matched trades
+                                        merged_trades['formatted_time'] = merged_trades['timestamp'].dt.strftime('%d:%m %H:%M')
+                                        
+                                        # Separate Long and Short
+                                        longs = merged_trades[merged_trades['tradeSignal'] == 'OPEN_LONG']
+                                        shorts = merged_trades[merged_trades['tradeSignal'] == 'OPEN_SHORT']
+                                        
+                                        if not longs.empty:
+                                            fig_trades.add_trace(go.Scatter(
+                                                x=longs['formatted_time'],
+                                                y=longs['price'],
+                                                mode='markers',
+                                                name='OPEN_LONG',
+                                                marker=dict(
+                                                    color='#FF4B4B',
+                                                    size=18, 
+                                                    symbol='triangle-up',
+                                                    line=dict(width=2, color='white')
+                                                ),
+                                                hovertemplate='<b>OPEN_LONG</b><br>Time: %{x}<br>Price: %{y}<br>Signal: %{customdata[0]:.2f}<extra></extra>',
+                                                customdata=longs[['timeSignal', 'snapshot']]
+                                            ), secondary_y=False)
+                                            
+                                        if not shorts.empty:
+                                            fig_trades.add_trace(go.Scatter(
+                                                x=shorts['formatted_time'],
+                                                y=shorts['price'],
+                                                mode='markers',
+                                                name='OPEN_SHORT',
+                                                marker=dict(
+                                                    color='#00CC96',
+                                                    size=18, 
+                                                    symbol='triangle-down',
+                                                    line=dict(width=2, color='white')
+                                                ),
+                                                hovertemplate='<b>OPEN_SHORT</b><br>Time: %{x}<br>Price: %{y}<br>Signal: %{customdata[0]:.2f}<extra></extra>',
+                                                customdata=shorts[['timeSignal', 'snapshot']]
+                                            ), secondary_y=False)
                                 
                                 # Calculate dynamic Y-axis range
                                 y_min = df_trades['price'].min()
@@ -1062,13 +956,10 @@ with tab_snapshots:
                                 
                                 # Add PTF horizontal line
                                 if ptf:
-                                    fig_trades.add_hline(y=ptf, line_dash="dash", line_color="yellow", annotation_text=f"PTF: {ptf:.2f}", annotation_position="right")
+                                    fig_trades.add_hline(y=ptf, line_dash="dash", line_color="white", annotation_text=f"MCP: {ptf:.2f}", annotation_position="right")
                                 
                                 fig_trades.update_layout(
-                                    title=dict(
-                                        text=f"Price Action: {selected_snap_contract}",
-                                        font=dict(size=20, color='white')
-                                    ),
+                                    # title removed
                                     template="plotly_dark",
                                     xaxis=dict(
                                         title="Time",
@@ -1096,26 +987,61 @@ with tab_snapshots:
                                     height=700,
                                     hovermode="x unified",
                                     legend=dict(
-                                        orientation="h",
-                                        yanchor="bottom",
-                                        y=1.02,
-                                        xanchor="right",
-                                        x=1
+                                        orientation="v",
+                                        yanchor="top",
+                                        y=1,
+                                        xanchor="left",
+                                        x=0.01,
+                                        bgcolor="rgba(0,0,0,0.5)"
                                     ),
                                     margin=dict(l=20, r=20, t=60, b=20),
                                     plot_bgcolor='rgba(0,0,0,0)',
-                                    paper_bgcolor='rgba(0,0,0,0)'
+                                    paper_bgcolor='rgba(0,0,0,0)',
+                                    hoverlabel=dict(
+                                        bgcolor="#262730",
+                                        font_color="white",
+                                        font_size=14,
+                                        bordercolor="rgba(255, 255, 255, 0.3)"
+                                    )
                                 )
-                                st.plotly_chart(fig_trades, use_container_width=True)
                                 
-                                # Trades Table
-                                st.dataframe(df_trades[['formatted_time', 'price', 'volume']], use_container_width=True, height=300)
+                                selected_points = plotly_events(
+                                    fig_trades,
+                                    click_event=True,
+                                    hover_event=False,
+                                    select_event=False,
+                                    override_height=700
+                                )
+                                
+                                if selected_points:
+                                    for point in selected_points:
+                                        # point contains: x, y, curveNumber, pointIndex
+                                        curve_num = point.get('curveNumber')
+                                        point_idx = point.get('pointIndex')
+                                        
+                                        snapshot_val = None
+                                        
+                                        # Trace 0 (Volume) and Trace 1 (Price) use df_trades
+                                        if curve_num in [0, 1]:
+                                            if point_idx < len(df_trades):
+                                                snapshot_val = df_trades.iloc[point_idx]['snapshot']
+                                        
+                                        if snapshot_val:
+                                            # snapshot_val is dd HH:MM, we need full timestamp
+                                            full_snapshot = minute_map.get(snapshot_val)
+                                            
+                                            if full_snapshot and full_snapshot != st.session_state.snap_query_minute:
+                                                st.session_state.snap_query_minute = full_snapshot
+                                                st.rerun()
+                                
+                                # Trades Table (Show Newest First)
+                                st.dataframe(df_trades.sort_values('timestamp', ascending=False)[['formatted_time', 'price', 'volume', 'snapshot']], use_container_width=True, height=300)
                             else:
                                 st.info("No trades found for this snapshot.")
 
                         # --- Right Column: Depth ---
                         with col_right:
-                            st.markdown("### Market Depth")
+                            st.markdown(f"### Depth ({snapshot_time_str})")
                             
                             mcp = board.get('mcp')
                             
@@ -1158,6 +1084,7 @@ with tab_snapshots:
                                         mode='lines',
                                         name='Bids',
                                         fill='tozeroy',
+                                        line_shape='hv',
                                         line=dict(color='#28a745'), # Green
                                         fillcolor='rgba(40, 167, 69, 0.2)'
                                     ))
@@ -1170,6 +1097,7 @@ with tab_snapshots:
                                         mode='lines',
                                         name='Asks',
                                         fill='tozeroy',
+                                        line_shape='hv',
                                         line=dict(color='#dc3545'), # Red
                                         fillcolor='rgba(220, 53, 69, 0.2)'
                                     ))
@@ -1180,11 +1108,18 @@ with tab_snapshots:
                                 
                                 fig_depth.update_layout(
                                     template="plotly_dark",
-                                    height=500,
+                                    height=700,
                                     margin=dict(l=10, r=10, t=30, b=10),
                                     xaxis_title="Price",
                                     yaxis_title="Cumulative Volume",
-                                    legend=dict(orientation="h", y=1.02, x=1, xanchor="right")
+                                    legend=dict(
+                                        orientation="v",
+                                        yanchor="top",
+                                        y=1,
+                                        xanchor="left",
+                                        x=0.01,
+                                        bgcolor="rgba(0,0,0,0.5)"
+                                    )
                                 )
                                 st.plotly_chart(fig_depth, use_container_width=True)
                                 
@@ -1207,17 +1142,17 @@ with tab_snapshots:
                                 # Apply Styling
                                 def highlight_depth(row):
                                     styles = [''] * 4
-                                    # Alış Columns (0, 1) - Very Subtle Green
+                                    # Alış Columns (0, 1) - Very Subtle Green (Almost Black)
                                     if pd.notna(row[('Alış', 'Fiyat')]):
                                         # Very dark green background, standard green text
-                                        styles[0] = 'background-color: #0e2a15; color: #4caf50' 
-                                        styles[1] = 'background-color: #0e2a15; color: #4caf50'
+                                        styles[0] = 'background-color: #051408; color: #4caf50' 
+                                        styles[1] = 'background-color: #051408; color: #4caf50'
                                     
-                                    # Satış Columns (2, 3) - Very Subtle Red
+                                    # Satış Columns (2, 3) - Very Subtle Red (Almost Black)
                                     if pd.notna(row[('Satış', 'Fiyat')]):
                                         # Very dark red background, standard red text
-                                        styles[2] = 'background-color: #2a0e0e; color: #ff5252'
-                                        styles[3] = 'background-color: #2a0e0e; color: #ff5252'
+                                        styles[2] = 'background-color: #140505; color: #ff5252'
+                                        styles[3] = 'background-color: #140505; color: #ff5252'
                                         
                                     return styles
 
@@ -1225,7 +1160,7 @@ with tab_snapshots:
                                 st.dataframe(
                                     df_combined.style.apply(highlight_depth, axis=1).format("{:.2f}"), 
                                     use_container_width=True, 
-                                    height=500
+                                    height=300
                                 )
                                 
                             else:
