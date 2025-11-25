@@ -7,6 +7,7 @@ import pandas as pd
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 import pytz
+from streamlit_plotly_events import plotly_events
 
 # Set page config as the first Streamlit command
 st.set_page_config(layout="wide")
